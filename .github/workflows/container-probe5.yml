@@ -1,0 +1,46 @@
+# Probe 5: real images in nested rootless podman from a non-root job container.
+# (a) no-new-privileges with a single-uid mapping and ignore_chown_errors;
+# (b) the image's own user with subuid ranges and newuidmap (no no-new-privileges).
+# For cgwalters-forge/agentic-job.
+name: container-probe5
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: a-nnp-single-uid-ignore-chown
+            options: "--user 1001:1001 --security-opt no-new-privileges --security-opt seccomp=unconfined --security-opt apparmor=unconfined --security-opt systempaths=unconfined --device /dev/fuse"
+            storage: "--storage-opt overlay.ignore_chown_errors=true"
+          - name: a2-nnp-single-uid-vfs-ignore-chown
+            options: "--user 1001:1001 --security-opt no-new-privileges --security-opt seccomp=unconfined --security-opt apparmor=unconfined --security-opt systempaths=unconfined --device /dev/fuse"
+            storage: "--storage-driver vfs --storage-opt vfs.ignore_chown_errors=true"
+          - name: b-image-user-subuids-no-nnp
+            options: "--user 1000:1000 --security-opt seccomp=unconfined --security-opt apparmor=unconfined --security-opt systempaths=unconfined --device /dev/fuse"
+            storage: ""
+    name: ${{ matrix.name }}
+    container:
+      image: quay.io/podman/stable:latest
+      options: ${{ matrix.options }}
+    env:
+      HOME: /tmp/home
+      ST: ${{ matrix.storage }}
+    steps:
+      - name: Real images
+        run: |
+          set +e
+          mkdir -p "$HOME"; id; grep -E 'CapEff|NoNewPrivs' /proc/self/status | tr '\n' ' '; echo
+          echo "RESULT subuid entry: $(grep -E "^(podman|$(id -u)):" /etc/subuid | tr '\n' ' ')"
+          sudo -n true >/dev/null 2>&1; echo "RESULT sudo -n true: rc=$? (0 means a route to root, and so to the docker socket)"
+          podman $ST unshare cat /proc/self/uid_map 2>/dev/null | tr -s ' ' | tr '\n' ';' | sed 's/^/RESULT uid_map: /'; echo
+          timeout 300 podman $ST run --rm registry.fedoraproject.org/fedora-minimal:latest sh -c 'id; ls -ln /etc/shadow | cut -c1-40' > /tmp/f.out 2>&1; rc=$?; tail -4 /tmp/f.out | cut -c1-220; echo "RESULT fedora-minimal run: rc=$rc"
+          printf 'FROM registry.fedoraproject.org/fedora-minimal:latest\nRUN microdnf -y install jq shadow-utils && useradd u\nUSER u\nRUN id && jq --version\n' > /tmp/Containerfile
+          timeout 500 podman $ST build -t localhost/probe -f /tmp/Containerfile /tmp > /tmp/b.out 2>&1; rc=$?; tail -4 /tmp/b.out | cut -c1-220; echo "RESULT podman build with a second user: rc=$rc"
+          timeout 120 podman $ST run --rm localhost/probe id > /tmp/r.out 2>&1; rc=$?; tail -1 /tmp/r.out | cut -c1-200; echo "RESULT run the built image: rc=$rc"
+          out=$(curl -s --max-time 5 --unix-socket /var/run/docker.sock http://d/version 2>&1); echo "RESULT docker socket: $([ $? -eq 0 ] && echo "$out" | grep -q ApiVersion && echo USABLE || echo 'not usable')"
+          podman $ST unshare sh -c 'curl -s --max-time 5 --unix-socket /var/run/docker.sock http://d/version 2>/dev/null | grep -q ApiVersion && echo USABLE || echo "not usable"' 2>/dev/null | tail -1 | sed 's/^/RESULT docker socket from inside the user namespace: /'
+          touch "$GITHUB_WORKSPACE/.probe" 2>/dev/null && echo "RESULT workspace writable: yes" || echo "RESULT workspace writable: no"
