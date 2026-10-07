@@ -1,0 +1,69 @@
+# Probe 2 (corrected): can a non-root step in a GitHub job container run a
+# nested rootless container, with no route to the host's docker socket?
+# For cgwalters-forge/agentic-job. No secrets.
+name: container-probe3
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: runner-uid-default-profiles
+            options: "--user 1001:1001"
+          - name: runner-uid-nnp
+            options: "--user 1001:1001 --security-opt no-new-privileges"
+          - name: runner-uid-nnp-loose
+            options: "--user 1001:1001 --security-opt no-new-privileges --security-opt seccomp=unconfined --security-opt apparmor=unconfined --security-opt systempaths=unconfined --device /dev/fuse --device /dev/kvm --group-add 991"
+          - name: runner-uid-loose-setuid-ok
+            options: "--user 1001:1001 --security-opt seccomp=unconfined --security-opt apparmor=unconfined --security-opt systempaths=unconfined --device /dev/fuse"
+          - name: root-default
+            options: ""
+    name: ${{ matrix.name }}
+    container:
+      image: quay.io/podman/stable:latest
+      options: ${{ matrix.options }}
+    env:
+      HOME: /tmp/home
+    steps:
+      - name: Identity and confinement
+        run: |
+          mkdir -p "$HOME"
+          id; grep -E 'CapEff|Seccomp:|NoNewPrivs' /proc/self/status | tr '\n' ' '; echo
+          echo "apparmor: $(cat /proc/self/attr/current 2>/dev/null)"
+          echo "host sysctl apparmor_restrict_unprivileged_userns: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>&1)"
+          echo "host sysctl unprivileged_userns_clone: $(cat /proc/sys/kernel/unprivileged_userns_clone 2>&1)"
+          echo "max_user_namespaces: $(cat /proc/sys/user/max_user_namespaces 2>&1)"
+          echo "kernel: $(uname -r)"
+      - name: Host docker socket
+        run: |
+          set +e
+          ls -ln /var/run/docker.sock
+          out=$(curl -s --max-time 5 --unix-socket /var/run/docker.sock http://d/version 2>&1); rc=$?
+          if [ $rc -eq 0 ] && echo "$out" | grep -q ApiVersion; then echo "RESULT socket: USABLE (root on the host)"; else echo "RESULT socket: not usable (curl rc=$rc)"; fi
+          echo "setuid-root files in the image: $(find / -xdev -perm -4000 -user root 2>/dev/null | tr '\n' ' ')"
+          echo "file caps: $(getcap -r /usr/bin 2>/dev/null | tr '\n' ' ')"
+          if command -v sudo >/dev/null; then sudo -n true 2>&1 | head -1; else echo "no sudo in image"; fi
+      - name: Workspace and host mounts as this user
+        run: |
+          set +e
+          for d in "$GITHUB_WORKSPACE" /__w/_temp /__t /github/home; do if touch "$d/.probe" 2>/dev/null; then echo "RESULT write $d: yes"; rm -f "$d/.probe"; else echo "RESULT write $d: no"; fi; done
+          ls -ldn "$GITHUB_WORKSPACE" /__t
+      - name: User namespace and nested rootless podman
+        run: |
+          set +e
+          unshare -Ur true; echo "RESULT unshare -Ur: rc=$?"
+          unshare -U true; echo "RESULT unshare -U (no map): rc=$?"
+          podman info --format '{{.Host.Security.Rootless}} {{.Store.GraphDriverName}}' 2>&1 | tail -2; echo "RESULT podman info: rc=$?"
+          timeout 150 podman run --rm quay.io/podman/hello >/tmp/p.out 2>&1; rc=$?; tail -4 /tmp/p.out; echo "RESULT podman run: rc=$rc"
+          timeout 150 podman --storage-driver vfs run --rm --network none quay.io/podman/hello >/tmp/p2.out 2>&1; rc=$?; tail -3 /tmp/p2.out; echo "RESULT podman vfs no-net: rc=$rc"
+          [ -e /dev/kvm ] && { ls -ln /dev/kvm; if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then echo "RESULT kvm: usable"; else echo "RESULT kvm: present, no access"; fi; } || echo "RESULT kvm: absent"
+          true
+      - uses: actions/checkout@v6
+        continue-on-error: true
+      - name: Did checkout work
+        run: |
+          [ -e README.md ] && echo "RESULT checkout: ok" || echo "RESULT checkout: FAILED"
