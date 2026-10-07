@@ -22,3 +22,12 @@ add_comment = { max = 1 }
 noop = { max = 1 }
 missing_tool = { max = 3 }
 missing_data = { max = 3 }
+
+# Which events may start a run from this repository, and who may start
+# one (`agentic-job event`). Without this table no event does.
+[trigger]
+events = ["issue_comment", "pull_request", "workflow_dispatch"]
+roles = ["admin", "maintain", "write"]
+bots = []
+forks = false
+commands = ["/agent"]

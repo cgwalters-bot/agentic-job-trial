@@ -1,0 +1,76 @@
+# A caller started by a slash command: `/agent REQUEST` as a comment on
+# an issue or pull request of this repository starts a run, for whoever
+# holds the write role here. The `[trigger]` table of the bounds file
+# says who may and from which events, and docs/events.md how the
+# decision is made. Copy this file with the bounds and configuration
+# files it names, as example.yml says.
+#
+# The request reaches the agent inside the task file, fenced, after the
+# standing `task` below; no text of the comment is in a script. The run's
+# comment goes back to the issue or pull request the command was on, and
+# a status comment there says the run started and how it ended.
+name: agent-command
+run-name: "/agent on #${{ github.event.issue.number }} by ${{ github.actor }}"
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  run:
+    # No `if` on the command here, unlike example-command.yml: every
+    # comment reaches the policy job, so that its refusals (a comment
+    # that is no command, the status comment by github-actions[bot]) are
+    # made by the binary and recorded.
+    # One run at a time for each issue or pull request, as a group of this
+    # job and not of the workflow: a workflow-level group is joined before
+    # `if` is evaluated, so any comment at all would cancel a command
+    # waiting its turn. A third command still replaces a waiting second
+    # one, since GitHub keeps one pending run per group.
+    concurrency:
+      group: agent-item-${{ github.event.issue.number }}
+    # Another repository names the workflow by the commit it has read:
+    #   uses: cgwalters-forge/agentic-job/.github/workflows/agentic-job.yml@COMMIT
+    uses: cgwalters-forge/agentic-job/.github/workflows/agentic-job.yml@1a04904f9854dc14b5346b40acb1fa539127dbdb
+    permissions:
+      id-token: write
+      # For the job's own token to apply the outputs here and to post the
+      # status comment: the branch of a pull request, the comments.
+      contents: write
+      issues: write
+      pull-requests: write
+    with:
+      id: item-${{ github.event.issue.number }}
+      event: true
+      task: >-
+        You answer /agent requests on this repository's issues and pull requests. Do what the
+        request below asks, within what the bounds allow, and answer with one comment. Propose a
+        change as a pull request only when the request asks for one.
+      repo: ${{ github.repository }}
+      outputs: add_comment,create_pull_request,noop
+      allow: .github/agentic-job/allow.toml
+      config: .github/agentic-job/hosted.toml
+      # The scripted agent, which answers with one comment; for a real one
+      # see the commented lines of example.yml.
+      agent: fake
+      setup: .github/agentic-job/event.sh
+      timeout: "10"
+      max-requests: "0"
+      budget: "100"
+      refused-pull-request: branch
+
+  # The payload GitHub delivered, kept as an artifact so that a recorded
+  # one can become a test fixture of agentic-job. It is public data.
+  record:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - run: cp "$GITHUB_EVENT_PATH" "$RUNNER_TEMP/event-$GITHUB_RUN_ID.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: event-payload
+          path: ${{ runner.temp }}/event-*.json
+          retention-days: 7
