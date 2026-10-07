@@ -1,0 +1,60 @@
+# Probe: what a GitHub job container gives a step, and which docker options
+# let a step run a nested rootless container. Written by the coordinator for
+# cgwalters-forge/agentic-job (operator's question, 2026-10-07). No secrets.
+name: container-probe
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            options: ""
+          - name: nonroot
+            options: "--user 1000:1000"
+          - name: seccomp-unconfined
+            options: "--security-opt seccomp=unconfined --security-opt apparmor=unconfined --device /dev/fuse"
+          - name: nonroot-loose
+            options: "--user 1000:1000 --security-opt seccomp=unconfined --security-opt apparmor=unconfined --security-opt systempaths=unconfined --device /dev/fuse --device /dev/kvm"
+          - name: cap-sysadmin
+            options: "--cap-add SYS_ADMIN --security-opt apparmor=unconfined --device /dev/fuse"
+          - name: nosock
+            options: "--user 1000:1000 --security-opt seccomp=unconfined --security-opt apparmor=unconfined --security-opt systempaths=unconfined --device /dev/fuse -v /dev/null:/var/run/docker.sock"
+    name: ${{ matrix.name }}
+    container:
+      image: quay.io/podman/stable:latest
+      options: ${{ matrix.options }}
+    steps:
+      - name: Who and what am I
+        run: |
+          id; echo "caps: $(grep -E 'Cap(Eff|Bnd)' /proc/self/status | tr '\n' ' ')"
+          echo "seccomp: $(grep Seccomp: /proc/self/status)"; echo "nnp: $(grep NoNewPrivs /proc/self/status)"
+          echo "apparmor: $(cat /proc/self/attr/current 2>/dev/null)"
+          echo "userns map: $(cat /proc/self/uid_map | tr -s ' ')"
+          echo "env with tokens: $(env | grep -cE 'ACTIONS_|GITHUB_TOKEN' )"
+      - name: What of the host is mounted in
+        run: |
+          grep -E ' /(__w|__e|__t|github|var/run|run|dev)' /proc/self/mountinfo | awk '{print $4, "->", $5, $6}' | sort -u | head -40
+          ls -la /var/run/docker.sock 2>&1 || true
+          echo "writable host mounts:"; for d in /__w /__e /__t /github/home /github/workflow /github/file_commands; do [ -e "$d" ] && { touch "$d/.probe" 2>/dev/null && echo "  $d writable" || echo "  $d read-only"; rm -f "$d/.probe" 2>/dev/null; }; done; true
+      - name: Is the host's docker socket usable from here (host escape)
+        run: |
+          if [ -S /var/run/docker.sock ]; then
+            curl -s --max-time 5 --unix-socket /var/run/docker.sock http://d/version | head -c 200 && echo " <- docker API answered: this is root on the host" || echo "socket present, no answer (permission?)"
+          else echo "no docker socket"; fi
+      - name: Can I see host processes or devices
+        run: |
+          echo "pid1: $(cat /proc/1/comm)"; ls /dev | tr '\n' ' '; echo
+          ls -la /dev/kvm 2>&1 || true
+      - name: Nested rootless container
+        run: |
+          set +e
+          unshare -Ur true && echo "userns: ok" || echo "userns: DENIED"
+          podman --version
+          timeout 120 podman run --rm quay.io/podman/hello 2>&1 | tail -5; echo "podman run exit: $?"
+          timeout 120 podman run --rm --storage-driver vfs quay.io/podman/hello 2>&1 | tail -3; echo "podman vfs exit: $?"
+          true
