@@ -1,0 +1,52 @@
+# Probe 4: how far nested rootless podman goes for a non-root, no-new-privileges
+# step in a GitHub job container on hosted ubuntu-26.04. For cgwalters-forge/agentic-job.
+name: container-probe4
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: nnp-loose
+            options: "--user 1001:1001 --security-opt no-new-privileges --security-opt seccomp=unconfined --security-opt apparmor=unconfined --security-opt systempaths=unconfined --device /dev/fuse --device /dev/kvm --group-add 991"
+          - name: nnp-apparmor-only
+            options: "--user 1001:1001 --security-opt no-new-privileges --security-opt apparmor=unconfined --device /dev/fuse"
+          - name: nnp-seccomp-only
+            options: "--user 1001:1001 --security-opt no-new-privileges --security-opt seccomp=unconfined --device /dev/fuse"
+          - name: nnp-loose-masked-proc
+            options: "--user 1001:1001 --security-opt no-new-privileges --security-opt seccomp=unconfined --security-opt apparmor=unconfined --device /dev/fuse"
+    name: ${{ matrix.name }}
+    container:
+      image: quay.io/podman/stable:latest
+      options: ${{ matrix.options }}
+    env:
+      HOME: /tmp/home
+    steps:
+      - name: Nested rootless podman, in detail
+        run: |
+          set +e
+          mkdir -p "$HOME"; id; grep -E 'CapEff|Seccomp:|NoNewPrivs' /proc/self/status | tr '\n' ' '; echo
+          echo "label of this shell: $(cat /proc/self/attr/current)"
+          podman unshare cat /proc/self/uid_map 2>&1 | tr -s ' ' | sed 's/^/RESULT uid_map in podman unshare:/'
+          podman unshare cat /proc/self/attr/current 2>&1 | sed 's/^/RESULT label inside podman unshare: /'
+          podman info --format 'RESULT podman: rootless={{.Host.Security.Rootless}} driver={{.Store.GraphDriverName}} runtime={{.Host.OCIRuntime.Name}} netns={{.Host.NetworkBackend}}' 2>&1 | tail -1
+          timeout 200 podman run --rm quay.io/podman/hello 2>&1 | grep -c 'Hello Podman World' | sed 's/^/RESULT hello ran (1=yes): /'
+          timeout 300 podman run --rm registry.fedoraproject.org/fedora-minimal:latest sh -c 'id; cat /proc/self/uid_map; ls -ln /etc/shadow /usr/bin/su 2>&1 | head -3' > /tmp/f.out 2>&1; rc=$?; tail -6 /tmp/f.out; echo "RESULT fedora-minimal run: rc=$rc"
+          printf 'FROM registry.fedoraproject.org/fedora-minimal:latest\nRUN microdnf -y install jq && useradd u && chown u /home/u\nUSER u\nRUN id\n' > /tmp/Containerfile
+          timeout 400 podman build -t probe -f /tmp/Containerfile /tmp > /tmp/b.out 2>&1; rc=$?; tail -5 /tmp/b.out; echo "RESULT podman build with a second uid: rc=$rc"
+          timeout 120 podman run --rm --network none probe id 2>&1 | tail -1; echo "RESULT run built image: rc=$?"
+          [ -e /dev/kvm ] && { [ -w /dev/kvm ] && echo "RESULT kvm: usable" || echo "RESULT kvm: no access"; } || echo "RESULT kvm: absent"
+      - name: What could reach the host from here
+        run: |
+          set +e
+          out=$(curl -s --max-time 5 --unix-socket /var/run/docker.sock http://d/version 2>&1); echo "RESULT docker socket: $([ $? -eq 0 ] && echo "$out" | grep -q ApiVersion && echo USABLE || echo 'not usable')"
+          podman unshare sh -c 'curl -s --max-time 5 --unix-socket /var/run/docker.sock http://d/version >/dev/null 2>&1 && echo USABLE || echo "not usable"' 2>&1 | sed 's/^/RESULT docker socket from inside a user namespace: /'
+          echo "RESULT host pids visible: $(ls /proc | grep -c '^[0-9]')"
+          echo "RESULT /proc/kcore readable: $([ -r /proc/kcore ] && echo yes || echo no); sysrq-trigger writable: $([ -w /proc/sysrq-trigger ] && echo yes || echo no); /sys/kernel writable: $([ -w /sys/kernel ] && echo yes || echo no)"
+          echo "RESULT can reach metadata 169.254.169.254: $(curl -s -o /dev/null -w '%{http_code}' --max-time 4 http://169.254.169.254/metadata/instance?api-version=2021-02-01 -H Metadata:true 2>&1)"
+          echo "RESULT token vars in step env: $(env | grep -oE '^(ACTIONS_[A-Z_]+|GITHUB_TOKEN)' | tr '\n' ' ')"
+          ls -la /__w/_temp 2>&1 | head -12
